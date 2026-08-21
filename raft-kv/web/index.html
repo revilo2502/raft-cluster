@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Raft KV Cluster</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#c9d1d9; --dim:#8b949e;
+          --leader:#2ea043; --candidate:#d29922; --follower:#58a6ff; --dead:#f85149; }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, Segoe UI, sans-serif; margin:0; padding:24px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 24px; }
+  .cluster { display:flex; gap:20px; flex-wrap:wrap; }
+  .node { background: var(--panel); border: 2px solid var(--border); border-radius: 10px; padding: 16px; width: 260px; transition: all .2s; }
+  .node.leader { border-color: var(--leader); box-shadow: 0 0 16px rgba(46,160,67,.35); }
+  .node.candidate { border-color: var(--candidate); }
+  .node.dead { opacity: 0.35; border-color: var(--dead); }
+  .node-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
+  .node-id { font-weight:600; font-size:15px; }
+  .badge { font-size:11px; padding:3px 8px; border-radius:12px; text-transform:uppercase; font-weight:600; letter-spacing:.5px; }
+  .badge.leader { background: var(--leader); color:#000; }
+  .badge.candidate { background: var(--candidate); color:#000; }
+  .badge.follower { background: var(--follower); color:#000; }
+  .badge.dead { background: var(--dead); color:#fff; }
+  .row { display:flex; justify-content:space-between; font-size:12px; color:var(--dim); margin:4px 0; }
+  .row b { color: var(--text); }
+  .log { margin-top:10px; background:#010409; border-radius:6px; padding:8px; font-family: monospace; font-size:11px; max-height:120px; overflow-y:auto; }
+  .log-entry { color: var(--dim); padding:2px 0; }
+  .log-entry.committed { color: var(--leader); }
+  .btns { margin-top:12px; display:flex; gap:8px; }
+  button { flex:1; background:#21262d; border:1px solid var(--border); color:var(--text); border-radius:6px; padding:6px; cursor:pointer; font-size:12px; }
+  button:hover { background:#30363d; }
+  button.danger:hover { background: var(--dead); }
+  .controls { margin: 24px 0; background: var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .controls input { background:#0d1117; border:1px solid var(--border); color:var(--text); padding:8px; border-radius:6px; font-size:13px; }
+  .controls button.primary { background: var(--follower); color:#000; font-weight:600; flex:none; padding:8px 16px; }
+  #log-output { font-family: monospace; font-size:12px; color: var(--dim); margin-top:8px; }
+</style>
+</head>
+<body>
+  <h1>🗳️ Raft KV Cluster</h1>
+  <div class="sub">Leader election + log replication, live. Kill the leader and watch a new one get elected.</div>
+
+  <div class="controls">
+    <input id="setKey" placeholder="key" />
+    <input id="setVal" placeholder="value" />
+    <button class="primary" onclick="doSet()">SET</button>
+    <input id="getKey" placeholder="key to read" />
+    <button class="primary" onclick="doGet()">GET</button>
+    <div id="log-output"></div>
+  </div>
+
+  <div class="cluster" id="cluster"></div>
+
+<script>
+const NODES = [
+  { id: "node1", url: "http://localhost:8001" },
+  { id: "node2", url: "http://localhost:8002" },
+  { id: "node3", url: "http://localhost:8003" },
+];
+
+function logMsg(msg) {
+  document.getElementById('log-output').textContent = msg;
+}
+
+async function fetchStatus(node) {
+  try {
+    const res = await fetch(node.url + "/status", { cache: "no-store" });
+    return await res.json();
+  } catch (e) {
+    return { id: node.id, state: "unreachable", alive: false, log: [], peers: [] };
+  }
+}
+
+async function refresh() {
+  const cluster = document.getElementById("cluster");
+  const statuses = await Promise.all(NODES.map(fetchStatus));
+  cluster.innerHTML = "";
+  statuses.forEach((s, i) => {
+    const node = NODES[i];
+    const dead = s.alive === false || s.state === "unreachable";
+    const cls = dead ? "dead" : s.state;
+    const div = document.createElement("div");
+    div.className = "node " + cls;
+    const logHtml = (s.log || []).slice(-6).map(e =>
+      `<div class="log-entry ${e.index <= s.commitIndex ? 'committed' : ''}">#${e.index} t${e.term}: ${e.command}</div>`
+    ).join("") || '<div class="log-entry">empty</div>';
+
+    div.innerHTML = `
+      <div class="node-header">
+        <span class="node-id">${s.id || node.id}</span>
+        <span class="badge ${cls}">${dead ? "DOWN" : s.state}</span>
+      </div>
+      <div class="row"><span>Term</span><b>${s.term ?? "-"}</b></div>
+      <div class="row"><span>Leader</span><b>${s.leader || "-"}</b></div>
+      <div class="row"><span>Commit idx</span><b>${s.commitIndex ?? "-"}</b></div>
+      <div class="row"><span>Log length</span><b>${s.logLength ?? 0}</b></div>
+      <div class="log">${logHtml}</div>
+      <div class="btns">
+        <button class="danger" onclick="kill('${node.id}')">Kill</button>
+        <button onclick="revive('${node.id}')">Revive</button>
+      </div>
+    `;
+    cluster.appendChild(div);
+  });
+}
+
+async function kill(id) {
+  const node = NODES.find(n => n.id === id);
+  await fetch(node.url + "/admin/kill", { method: "POST" }).catch(()=>{});
+  logMsg(`Killed ${id}`);
+}
+async function revive(id) {
+  const node = NODES.find(n => n.id === id);
+  await fetch(node.url + "/admin/revive", { method: "POST" }).catch(()=>{});
+  logMsg(`Revived ${id}`);
+}
+
+async function doSet() {
+  const key = document.getElementById("setKey").value;
+  const value = document.getElementById("setVal").value;
+  for (const node of NODES) {
+    try {
+      const res = await fetch(`${node.url}/set?key=${encodeURIComponent(key)}&value=${encodeURIComponent(value)}`, { method: "POST" });
+      const data = await res.json();
+      if (data.ok) { logMsg(`SET ${key}=${value} via ${node.id} (index ${data.index}, term ${data.term})`); return; }
+    } catch (e) {}
+  }
+  logMsg("SET failed: no leader reachable");
+}
+
+async function doGet() {
+  const key = document.getElementById("getKey").value;
+  for (const node of NODES) {
+    try {
+      const res = await fetch(`${node.url}/get?key=${encodeURIComponent(key)}`);
+      const data = await res.json();
+      logMsg(`GET ${key} -> ${data.found ? data.value : "(not found)"} [from ${node.id}]`);
+      return;
+    } catch (e) {}
+  }
+  logMsg("GET failed: no node reachable");
+}
+
+setInterval(refresh, 500);
+refresh();
+</script>
+</body>
+</html>
